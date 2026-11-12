@@ -15,28 +15,6 @@ enum ParseState {
     }
 }
 
-enum ConversionAction: String, CaseIterable, Identifiable {
-    case escape
-    case unescape
-    case chineseToUnicode
-    case unicodeToChinese
-    case jsonToQuery
-    case queryToJSON
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .escape: return "转义"
-        case .unescape: return "去除转义"
-        case .chineseToUnicode: return "中文转 Unicode"
-        case .unicodeToChinese: return "Unicode 转中文"
-        case .jsonToQuery: return "JSON 转 Get 参数"
-        case .queryToJSON: return "Get 参数转 JSON"
-        }
-    }
-}
-
 final class AppModel: ObservableObject {
     let undoManager = UndoManager()
     private(set) weak var editor: EditorController?
@@ -51,9 +29,30 @@ final class AppModel: ObservableObject {
     @Published var selectionLength = 0
     @Published var lineCount = 1
     @Published var characterCount = 0
-    @Published var indentWidth = 2
+    /// 格式化缩进宽度，持久化到 UserDefaults。
+    @Published var indentWidth: Int {
+        didSet {
+            guard indentWidth != oldValue else { return }
+            UserDefaults.standard.set(indentWidth, forKey: Self.indentDefaultsKey)
+        }
+    }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
+
+    /// 主题外观模式，持久化到 UserDefaults。
+    @Published var appearanceMode: AppearanceMode {
+        didSet {
+            guard appearanceMode != oldValue else { return }
+            applyAppearance()
+            UserDefaults.standard.set(appearanceMode.rawValue, forKey: Self.appearanceDefaultsKey)
+        }
+    }
+    /// 左右选中联动开关：锁定（默认）时两侧互相跟随，解锁后各自独立。
+    @Published var syncSelection: Bool {
+        didSet {
+            UserDefaults.standard.set(syncSelection, forKey: Self.syncDefaultsKey)
+        }
+    }
 
     @Published var searchQuery = "" {
         didSet {
@@ -94,9 +93,23 @@ final class AppModel: ObservableObject {
     private var searchWork: DispatchWorkItem?
     private var toastWork: DispatchWorkItem?
     private var undoObservers: [NSObjectProtocol] = []
+    private var isSyncingSelection = false
+
+    private static let appearanceDefaultsKey = "QJson.appearanceMode"
+    private static let syncDefaultsKey = "QJson.syncSelection"
+    private static let indentDefaultsKey = "QJson.indentWidth"
 
     init() {
+        let defaults = UserDefaults.standard
+        appearanceMode = AppearanceMode(rawValue: defaults.string(forKey: Self.appearanceDefaultsKey) ?? "") ?? .system
+        if defaults.object(forKey: Self.syncDefaultsKey) != nil {
+            syncSelection = defaults.bool(forKey: Self.syncDefaultsKey)
+        } else {
+            syncSelection = true
+        }
+        indentWidth = defaults.integer(forKey: Self.indentDefaultsKey) == 4 ? 4 : 2
         observeUndo()
+        applyAppearance()
     }
 
     deinit {
@@ -210,6 +223,10 @@ final class AppModel: ObservableObject {
         } else {
             editor?.setSearchHighlights(ranges: [], current: nil)
         }
+        // 重新解析后节点区间已变化，按当前光标重新对齐树选中。
+        if syncSelection, let editor {
+            syncTreeSelection(to: editor.selectedOffset)
+        }
     }
 
     private func refreshNow() {
@@ -252,10 +269,95 @@ final class AppModel: ObservableObject {
 
     // MARK: - 光标
 
-    func editorCaretMoved(line: Int, column: Int, selectionLength: Int) {
+    func editorCaretMoved(line: Int, column: Int, selectionLength: Int, offset: Int) {
         caretLine = line
         caretColumn = column
         self.selectionLength = selectionLength
+        syncTreeSelection(to: offset)
+    }
+
+    // MARK: - 左右选中联动
+
+    /// 切换左右联动；重新锁定时立即按当前光标对齐一次。
+    func toggleSyncSelection() {
+        syncSelection.toggle()
+        guard syncSelection, let editor else { return }
+        syncTreeSelection(to: editor.selectedOffset)
+    }
+
+    /// 树行被选中时，把文本编辑器选中到该节点对应的行内片段。
+    func treeSelectionDidChange(row: JSONTreeRow) {
+        guard syncSelection, !isSyncingSelection else { return }
+        isSyncingSelection = true
+        defer { isSyncingSelection = false }
+        let node = row.node
+        let start = min(node.keyRange?.location ?? node.range.location, node.range.location)
+        editor?.selectNodeText(start: start, end: node.range.location + node.range.length)
+    }
+
+    /// 按文本偏移找到最深节点，并让树视图选中、滚动到对应行。
+    private func syncTreeSelection(to offset: Int) {
+        guard syncSelection, !isSyncingSelection, let root else { return }
+        let textLength = editor?.textLength ?? characterCount
+        let clamped = min(max(offset, 0), max(0, textLength - 1))
+        let node = deepestNode(at: clamped, in: root)
+        let id = node.range.location
+        guard treeUI.selectedRowID != id else { return }
+        isSyncingSelection = true
+        defer { isSyncingSelection = false }
+        if tree.rows.contains(where: { $0.id == id }) {
+            treeUI.selectedRowID = id
+            tree.pendingScrollTarget = id
+        } else {
+            revealTree(node: node, revealKeys: revealKeys(of: node))
+        }
+    }
+
+    /// 深度优先定位包含指定文本偏移的最深节点；子节点按起始位置有序，可二分。
+    private func deepestNode(at offset: Int, in root: JSONNode) -> JSONNode {
+        var current = root
+        while !current.children.isEmpty {
+            let children = current.children
+            var low = 0
+            var high = children.count - 1
+            var found = -1
+            while low <= high {
+                let mid = (low + high) / 2
+                if nodeStart(children[mid]) <= offset {
+                    found = mid
+                    low = mid + 1
+                } else {
+                    high = mid - 1
+                }
+            }
+            guard found >= 0 else { return current }
+            let child = children[found]
+            guard offset < child.range.location + child.range.length else { return current }
+            current = child
+        }
+        return current
+    }
+
+    /// 节点在文本中的起始偏移（对象成员从键名开始）。
+    private func nodeStart(_ node: JSONNode) -> Int {
+        min(node.keyRange?.location ?? node.range.location, node.range.location)
+    }
+
+    /// 揭示节点可见所需的祖先展开键（按层级，含根）。
+    private func revealKeys(of node: JSONNode) -> [String] {
+        var keys: [String] = []
+        var current = node.parent
+        while let ancestor = current {
+            keys.append(expansionKey(forNode: ancestor))
+            current = ancestor.parent
+        }
+        return keys
+    }
+
+    // MARK: - 外观
+
+    private func applyAppearance() {
+        NSApplication.shared.appearance = appearanceMode.appearance
     }
 
     // MARK: - 树
@@ -614,7 +716,7 @@ final class AppModel: ObservableObject {
         searchQuery = ""
     }
 
-    // MARK: - 格式化与转换
+    // MARK: - 格式化
 
     var canTransformText: Bool {
         guard !isParsing, let editor else { return false }
@@ -641,37 +743,6 @@ final class AppModel: ObservableObject {
         editor?.replaceAllText(JSONFormatter.minified(root), undoable: true)
         refreshNow()
         showToast("已压缩")
-    }
-
-    func applyConversion(_ action: ConversionAction) {
-        guard let editor else { return }
-        let ns = editor.text as NSString
-        let selectedRange = editor.textView.selectedRange()
-        let useSelection = selectedRange.length > 0
-        let targetRange = useSelection ? selectedRange : NSRange(location: 0, length: ns.length)
-        let segment = useSelection ? ns.substring(with: selectedRange) : editor.text
-        do {
-            let converted: String
-            switch action {
-            case .escape:
-                converted = JSONConversions.escape(segment)
-            case .unescape:
-                converted = try JSONConversions.unescape(segment)
-            case .chineseToUnicode:
-                converted = JSONConversions.chineseToUnicode(segment)
-            case .unicodeToChinese:
-                converted = JSONConversions.unicodeToChinese(segment)
-            case .jsonToQuery:
-                converted = try JSONConversions.jsonToQuery(segment)
-            case .queryToJSON:
-                converted = JSONConversions.queryToJSON(segment)
-            }
-            editor.replaceCharacters(in: targetRange, with: converted)
-            refreshNow()
-            showToast("\(action.title)完成")
-        } catch {
-            showToast(error.localizedDescription)
-        }
     }
 
     // MARK: - 文件与演示

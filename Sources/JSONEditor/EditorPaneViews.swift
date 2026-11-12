@@ -174,6 +174,8 @@ struct StatusBarView: View {
                 Text("选中 \(model.selectionLength)")
             }
             Text("字符 \(model.characterCount)")
+            Rectangle().fill(Theme.border).frame(width: 1, height: 12)
+            appearancePicker
         }
         .font(.system(size: 11))
         .foregroundColor(Theme.secondaryText)
@@ -218,6 +220,19 @@ struct StatusBarView: View {
                 .help("点击跳转到错误位置")
             }
         }
+    }
+
+    private var appearancePicker: some View {
+        Picker("主题", selection: $model.appearanceMode) {
+            ForEach(AppearanceMode.allCases) { mode in
+                Text(mode.label).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .controlSize(.small)
+        .fixedSize()
+        .help("主题外观：与系统同步 / 深色 / 白色")
     }
 
     private func formatted(_ interval: TimeInterval) -> String {

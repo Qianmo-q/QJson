@@ -42,11 +42,13 @@ struct TreeTable: NSViewRepresentable {
 
         context.coordinator.tableView = tableView
         context.coordinator.scrollView = scrollView
+        context.coordinator.installHoverTrackingIfNeeded()
         return scrollView
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.installHoverTrackingIfNeeded()
         context.coordinator.reloadIfNeeded()
         if let target = tree.pendingScrollTarget {
             context.coordinator.scrollTo(id: target)
@@ -68,9 +70,66 @@ struct TreeTable: NSViewRepresentable {
         private var lastAddContainerID: Int?
         private var lastRowCount = -1
         private var isReloading = false
+        private var hoverMonitor: Any?
+        private var hoverObserver: NSObjectProtocol?
 
         init(_ parent: TreeTable) {
             self.parent = parent
+        }
+
+        deinit {
+            if let hoverMonitor { NSEvent.removeMonitor(hoverMonitor) }
+            if let hoverObserver { NotificationCenter.default.removeObserver(hoverObserver) }
+        }
+
+        /// 悬停行按真实指针位置统一计算，避免行复用后残留悬停底色。
+        func installHoverTrackingIfNeeded() {
+            if hoverMonitor == nil {
+                hoverMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .leftMouseUp]) { [weak self] event in
+                    self?.updateHover(at: event.locationInWindow)
+                    return event
+                }
+                if let contentView = scrollView?.contentView {
+                    contentView.postsBoundsChangedNotifications = true
+                    hoverObserver = NotificationCenter.default.addObserver(
+                        forName: NSView.boundsDidChangeNotification,
+                        object: contentView,
+                        queue: .main
+                    ) { [weak self] _ in
+                        guard let self, let window = self.tableView?.window else { return }
+                        self.updateHover(at: window.mouseLocationOutsideOfEventStream)
+                    }
+                }
+            }
+            tableView?.window?.acceptsMouseMovedEvents = true
+        }
+
+        func updateHover(at windowPoint: NSPoint) {
+            guard let tableView else {
+                setHover(nil)
+                return
+            }
+            let point = tableView.convert(windowPoint, from: nil)
+            guard tableView.visibleRect.contains(point) else {
+                setHover(nil)
+                return
+            }
+            let tableRow = tableView.row(at: point)
+            guard tableRow >= 0, !isReloading else {
+                setHover(nil)
+                return
+            }
+            let entry = row(at: tableRow)
+            guard !entry.isAdd, let nodeRow = entry.row else {
+                setHover(nil)
+                return
+            }
+            setHover(nodeRow.id)
+        }
+
+        private func setHover(_ id: Int?) {
+            guard parent.ui.hoveredRowID != id else { return }
+            parent.ui.hoveredRowID = id
         }
 
         private var rowCount: Int {
@@ -177,3 +236,4 @@ struct TreeTable: NSViewRepresentable {
         }
     }
 }
+

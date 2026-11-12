@@ -103,7 +103,8 @@ final class EditorController: NSObject, NSTextViewDelegate {
             object: scrollView.contentView,
             queue: .main
         ) { [weak self] _ in
-            self?.scheduleHighlight()
+            // 同步着色：异步补色会让新滚出的文本先以默认近白色绘制，滚动时闪烁。
+            self?.refreshHighlight()
             self?.ruler.needsDisplay = true
         }
     }
@@ -111,6 +112,27 @@ final class EditorController: NSObject, NSTextViewDelegate {
     // MARK: - 对外操作
 
     var text: String { textView.string }
+
+    var textLength: Int { textView.textStorage?.length ?? 0 }
+
+    var selectedOffset: Int { textView.selectedRange().location }
+
+    /// 选中节点在文本中的首个行内片段（含键名，不跨行），并滚动到可见位置。
+    func selectNodeText(start: Int, end: Int) {
+        let length = textLength
+        guard length > 0 else { return }
+        let clampedStart = min(max(start, 0), length - 1)
+        let (line, _) = lineColumn(at: clampedStart, lineStarts: lineStarts)
+        let paragraph = paragraphRange(forLine: line, lineStarts: lineStarts, textLength: length)
+        var lineEnd = paragraph.location + paragraph.length
+        if lineEnd > paragraph.location, (textView.string as NSString).character(at: lineEnd - 1) == 0x0A {
+            lineEnd -= 1
+        }
+        let selectionEnd = min(max(end, clampedStart), lineEnd)
+        let range = NSRange(location: clampedStart, length: max(0, selectionEnd - clampedStart))
+        textView.setSelectedRange(range)
+        textView.scrollRangeToVisible(range)
+    }
 
     func replaceAllText(_ text: String, undoable: Bool) {
         let length = textView.textStorage?.length ?? 0
@@ -226,8 +248,14 @@ final class EditorController: NSObject, NSTextViewDelegate {
     }
 
     private func updateCaret() {
-        let caret = lineColumn(at: textView.selectedRange().location, lineStarts: lineStarts)
-        model?.editorCaretMoved(line: caret.line, column: caret.column, selectionLength: textView.selectedRange().length)
+        let selection = textView.selectedRange()
+        let caret = lineColumn(at: selection.location, lineStarts: lineStarts)
+        model?.editorCaretMoved(
+            line: caret.line,
+            column: caret.column,
+            selectionLength: selection.length,
+            offset: selection.location
+        )
     }
 
     // MARK: - 高亮

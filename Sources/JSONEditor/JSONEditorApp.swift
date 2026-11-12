@@ -1,5 +1,4 @@
 import AppKit
-import JSONCore
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -7,16 +6,11 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var isDropTargeted = false
     @State private var didStart = false
+    @State private var leftPaneWidth: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
-            HSplitView {
-                editorPane
-                    .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
-                TreePaneView(model: model, tree: model.tree)
-                    .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
-            }
-            conversionBar
+            splitView
             StatusBarView(model: model)
         }
         .background(Theme.background)
@@ -39,6 +33,47 @@ struct ContentView: View {
             EditorRepresentable(model: model)
                 .background(Theme.background)
         }
+    }
+
+    /// 左右分栏；锁按钮浮在分割线中点，控制选中同步开关。
+    private var splitView: some View {
+        GeometryReader { proxy in
+            HSplitView {
+                editorPane
+                    .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+                    .background(
+                        GeometryReader { inner in
+                            Color.clear
+                                .onAppear { leftPaneWidth = inner.size.width }
+                                .onChange(of: inner.size.width) { _, width in leftPaneWidth = width }
+                        }
+                    )
+                TreePaneView(model: model, tree: model.tree)
+                    .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .overlay(alignment: .topLeading) {
+                if leftPaneWidth > 0 {
+                    syncLockButton
+                        .position(x: leftPaneWidth, y: proxy.size.height / 2)
+                }
+            }
+        }
+    }
+
+    private var syncLockButton: some View {
+        Button {
+            model.toggleSyncSelection()
+        } label: {
+            Image(systemName: model.syncSelection ? "lock.fill" : "lock.open")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(model.syncSelection ? Theme.accent : Theme.secondaryText)
+                .frame(width: 18, height: 18)
+                .background(Circle().fill(Theme.controlBackground))
+                .overlay(Circle().stroke(Theme.border, lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.12), radius: 2, y: 1)
+        }
+        .buttonStyle(.plain)
+        .help(model.syncSelection ? "左右选中同步已锁定，点击解锁" : "左右选中同步已解锁，点击锁定")
     }
 
     private var editorHeader: some View {
@@ -121,37 +156,6 @@ struct ContentView: View {
         }
     }
 
-    private var conversionBar: some View {
-        HStack(spacing: 6) {
-            Text("转换")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(Theme.secondaryText)
-                .padding(.trailing, 2)
-            ForEach(ConversionAction.allCases) { action in
-                Button(action.title) {
-                    model.applyConversion(action)
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 11))
-                .foregroundColor(Theme.text)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Theme.controlBackground, in: RoundedRectangle(cornerRadius: 5))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 5).stroke(Theme.border, lineWidth: 1)
-                }
-                .help("对选中内容或全文执行：\(action.title)")
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 32)
-        .background(Theme.panelBackground)
-        .overlay(alignment: .top) {
-            Rectangle().fill(Theme.border).frame(height: 1)
-        }
-    }
-
     @ViewBuilder
     private var toastView: some View {
         if let toast = model.toast {
@@ -163,7 +167,7 @@ struct ContentView: View {
                 .background(.regularMaterial, in: Capsule())
                 .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
                 .padding(.trailing, 16)
-                .padding(.bottom, 72)
+                .padding(.bottom, 40)
                 .transition(.opacity)
                 .allowsHitTesting(false)
         }
@@ -232,12 +236,6 @@ struct AppCommands: Commands {
             Divider()
             Button("复制全部内容") { model.copyAll() }
                 .keyboardShortcut("c", modifiers: [.command, .shift])
-            Divider()
-            Menu("转换") {
-                ForEach(ConversionAction.allCases) { action in
-                    Button(action.title) { model.applyConversion(action) }
-                }
-            }
         }
         CommandMenu("视图") {
             Button("展开全部节点") { model.expandAll() }

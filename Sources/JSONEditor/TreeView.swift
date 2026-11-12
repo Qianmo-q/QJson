@@ -183,7 +183,6 @@ struct TreeRowView: View {
         case value
     }
 
-    @State private var hovering = false
     @State private var keyDraft = ""
     @State private var valueDraft = ""
     @State private var keyInvalid = false
@@ -192,6 +191,7 @@ struct TreeRowView: View {
 
     private var node: JSONNode { row.node }
     private var isSelected: Bool { ui.selectedRowID == row.id }
+    private var isHovered: Bool { ui.hoveredRowID == row.id }
     private var isEditingKey: Bool { ui.editingRowID == row.id && ui.editingKey }
     private var isEditingValue: Bool { ui.editingRowID == row.id && !ui.editingKey }
     private var isEditingAny: Bool { isEditingKey || isEditingValue }
@@ -236,7 +236,7 @@ struct TreeRowView: View {
                 .help(node.kind == .object ? "添加键值对" : "添加元素")
             }
 
-            if hovering && node.parent != nil && !isEditingAny {
+            if isHovered && node.parent != nil && !isEditingAny {
                 Button(action: onDelete) {
                     Text("删除")
                         .font(.system(size: 10, weight: .medium))
@@ -257,7 +257,6 @@ struct TreeRowView: View {
         .background(background)
         .contentShape(Rectangle())
         .onTapGesture { activateRow() }
-        .onHover { hovering = $0 }
         .contextMenu { contextMenu }
     }
 
@@ -309,7 +308,7 @@ struct TreeRowView: View {
 
     private var background: Color {
         if isSelected { return Theme.selectedRow }
-        if hovering { return Color(nsColor: Palette.hoverBackground) }
+        if isHovered { return Color(nsColor: Palette.hoverBackground) }
         return Color.clear
     }
 
@@ -319,6 +318,7 @@ struct TreeRowView: View {
         ui.commitToken += 1
         guard ui.editingRowID != row.id else { return }
         ui.selectedRowID = row.id
+        model.treeSelectionDidChange(row: row)
         if node.isContainer {
             model.toggleExpansion(rowID: row.id)
         }

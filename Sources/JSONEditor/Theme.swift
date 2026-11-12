@@ -1,6 +1,32 @@
 import AppKit
 import SwiftUI
 
+/// 主题外观：跟随系统 / 强制深色 / 强制白色（浅色）。
+enum AppearanceMode: String, CaseIterable, Identifiable {
+    case system
+    case dark
+    case light
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .system: return "与系统同步"
+        case .dark: return "深色"
+        case .light: return "白色"
+        }
+    }
+
+    /// 传给 NSApp.appearance 的外观；nil 表示跟随系统。
+    var appearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .dark: return NSAppearance(named: .darkAqua)
+        case .light: return NSAppearance(named: .aqua)
+        }
+    }
+}
+
 /// 跟随系统外观的动态配色。所有键、值、高亮色均提供浅色/深色两套。
 enum Palette {
     static func hex(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
