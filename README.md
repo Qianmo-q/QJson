@@ -25,7 +25,7 @@ QJson 面向「快速看一段 JSON、临时改几个值、复制走」的场景
 
 ## 安装（内部使用版）
 
-1. 从 [Releases](https://github.com/Qianmo-q/QJson/releases/latest) 下载 `QJson-3.0.0.dmg`；
+1. 从 [Releases](https://github.com/Qianmo-q/QJson/releases/latest) 下载 `QJson-0.3.0.dmg`；
 2. 打开 DMG，将 **QJson** 拖入 Applications；
 3. 首次启动若被 Gatekeeper 拦截：
    - 打开「系统设置 → 隐私与安全性」，在安全区域点击「仍要打开」；
