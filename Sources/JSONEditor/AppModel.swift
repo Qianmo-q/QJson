@@ -16,42 +16,39 @@ enum ParseState {
 }
 
 final class AppModel: ObservableObject {
-    let undoManager = UndoManager()
+    private(set) var undoManager = UndoManager()
     private(set) weak var editor: EditorController?
+    weak var workspace: WorkspaceModel?
+    private(set) var openDocument: OpenDocument?
+    private var documentCancellable: AnyCancellable?
+    private var pendingRevealRange: NSRange?
 
     @Published private(set) var parseState: ParseState = .idle
     @Published private(set) var isParsing = false
     @Published private(set) var root: JSONNode?
-    @Published var fileName: String?
-    @Published var toast: String?
     @Published var caretLine = 1
     @Published var caretColumn = 1
     @Published var selectionLength = 0
     @Published var lineCount = 1
     @Published var characterCount = 0
-    /// 格式化缩进宽度，持久化到 UserDefaults。
-    @Published var indentWidth: Int {
-        didSet {
-            guard indentWidth != oldValue else { return }
-            UserDefaults.standard.set(indentWidth, forKey: Self.indentDefaultsKey)
-        }
-    }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
 
-    /// 主题外观模式，持久化到 UserDefaults。
-    @Published var appearanceMode: AppearanceMode {
-        didSet {
-            guard appearanceMode != oldValue else { return }
-            applyAppearance()
-            UserDefaults.standard.set(appearanceMode.rawValue, forKey: Self.appearanceDefaultsKey)
-        }
+    var fileName: String? { openDocument?.fileName }
+    var isDirty: Bool { openDocument?.isDirty ?? false }
+    var isEmpty: Bool { openDocument == nil }
+    var toast: String? { workspace?.toast }
+    var indentWidth: Int {
+        get { workspace?.indentWidth ?? 2 }
+        set { workspace?.indentWidth = newValue }
     }
-    /// 左右选中联动开关：锁定（默认）时两侧互相跟随，解锁后各自独立。
-    @Published var syncSelection: Bool {
-        didSet {
-            UserDefaults.standard.set(syncSelection, forKey: Self.syncDefaultsKey)
-        }
+    var appearanceMode: AppearanceMode {
+        get { workspace?.appearanceMode ?? .system }
+        set { workspace?.appearanceMode = newValue }
+    }
+    var syncSelection: Bool {
+        get { workspace?.syncSelection ?? true }
+        set { workspace?.syncSelection = newValue }
     }
 
     @Published var searchQuery = "" {
@@ -83,33 +80,19 @@ final class AppModel: ObservableObject {
 
     private var expandedKeys: Set<String> = [""]
     private var lastText = ""
-    private var pendingOpenURL: URL?
-    private var didInitialLoad = false
     private var parseGeneration = 0
     private var parseWork: DispatchWorkItem?
     private var shouldRevealErrorAfterParse = false
     private var autoExpandRootOnNextParse = false
     private var searchGeneration = 0
     private var searchWork: DispatchWorkItem?
-    private var toastWork: DispatchWorkItem?
     private var undoObservers: [NSObjectProtocol] = []
     private var isSyncingSelection = false
 
-    private static let appearanceDefaultsKey = "QJson.appearanceMode"
-    private static let syncDefaultsKey = "QJson.syncSelection"
-    private static let indentDefaultsKey = "QJson.indentWidth"
-
-    init() {
-        let defaults = UserDefaults.standard
-        appearanceMode = AppearanceMode(rawValue: defaults.string(forKey: Self.appearanceDefaultsKey) ?? "") ?? .system
-        if defaults.object(forKey: Self.syncDefaultsKey) != nil {
-            syncSelection = defaults.bool(forKey: Self.syncDefaultsKey)
-        } else {
-            syncSelection = true
-        }
-        indentWidth = defaults.integer(forKey: Self.indentDefaultsKey) == 4 ? 4 : 2
+    init(workspace: WorkspaceModel? = nil, document: OpenDocument? = nil) {
+        self.workspace = workspace
         observeUndo()
-        applyAppearance()
+        if let document { bind(document) }
     }
 
     deinit {
@@ -128,29 +111,84 @@ final class AppModel: ObservableObject {
 
     func attach(editor: EditorController) {
         self.editor = editor
+        if editor.text != lastText {
+            editor.replaceTextSynchronized(lastText)
+        }
+        if let pendingRevealRange {
+            self.pendingRevealRange = nil
+            editor.reveal(pendingRevealRange, select: true)
+        }
         refreshUndoState()
-    }
-
-    /// 首次显示窗口时载入示例；若启动时通过 Finder 打开了文件，则优先打开该文件。
-    func startup() {
-        guard !didInitialLoad else { return }
-        didInitialLoad = true
-        if let url = pendingOpenURL {
-            pendingOpenURL = nil
-            open(url: url)
-            return
-        }
-        if let editor, editor.text.isEmpty {
-            loadDemo()
-        } else {
-            scheduleParse(editor?.text ?? "", immediate: true)
+        if workspace?.activeModel === self {
+            editor.focus()
         }
     }
 
-    // MARK: - 文本与解析
+    func detach(editor: EditorController) {
+        guard self.editor === editor else { return }
+        self.editor = nil
+    }
 
-    func editorTextDidChange(_ text: String, lineStarts: [Int]) {
+    func editorDidFocus() {
+        workspace?.focus(self)
+    }
+
+    func bind(_ document: OpenDocument) {
+        guard openDocument !== document else { return }
+        documentCancellable?.cancel()
+        undoObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        undoObservers.removeAll()
+        openDocument = document
+        undoManager = document.undoManager
+        observeUndo()
+        refreshUndoState()
+        synchronize(document.text, immediate: true, resetView: true)
+        documentCancellable = document.$text
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] text in
+                self?.synchronize(text, immediate: false, resetView: false)
+            }
+    }
+
+    private func synchronize(_ text: String, immediate: Bool, resetView: Bool) {
+        guard text != lastText || resetView else { return }
         lastText = text
+        characterCount = (text as NSString).length
+        isParsing = true
+        searchResult = .empty
+        currentHitIndex = nil
+        if resetView {
+            expandedKeys = []
+            autoExpandRootOnNextParse = true
+            treeUI.selectedRowID = nil
+            tree.pendingScrollTarget = nil
+            caretLine = 1
+            caretColumn = 1
+            selectionLength = 0
+            lineCount = 1
+        }
+        editor?.replaceTextSynchronized(text)
+        editor?.setSearchHighlights(ranges: [], current: nil)
+        scheduleParse(text, immediate: immediate)
+    }
+
+    func loadPastedText(_ text: String) {
+        guard let document = workspace?.createDocument(text: text, fileName: nil) else { return }
+        bind(document)
+        shouldRevealErrorAfterParse = true
+        synchronize(text, immediate: true, resetView: true)
+        showToast("已载入粘贴内容")
+    }
+
+    func editorTextDidChange(_ text: String, lineStarts: [Int], undoable: Bool = true) {
+        let previous = lastText
+        lastText = text
+        if undoable, let document = openDocument, text != previous {
+            document.applyTextChange(previous: previous, updated: text, undoable: true)
+        } else {
+            openDocument?.text = text
+        }
         characterCount = (text as NSString).length
         lineCount = max(1, lineStarts.count)
         isParsing = true
@@ -231,6 +269,36 @@ final class AppModel: ObservableObject {
 
     private func refreshNow() {
         scheduleParse(lastText, immediate: true)
+    }
+
+    private func replaceCharacters(_ range: NSRange, with replacement: String, undoable: Bool = true) {
+        if let editor {
+            if undoable {
+                editor.replaceCharacters(in: range, with: replacement)
+            } else {
+                let updated = replacing(range, with: replacement)
+                editor.replaceTextSynchronized(updated)
+                lastText = updated
+                characterCount = (updated as NSString).length
+                openDocument?.text = updated
+                scheduleParse(updated, immediate: true)
+            }
+            return
+        }
+        let updated = replacing(range, with: replacement)
+        guard updated != lastText else { return }
+        let previous = lastText
+        lastText = updated
+        characterCount = (updated as NSString).length
+        openDocument?.applyTextChange(previous: previous, updated: updated, undoable: undoable)
+        scheduleParse(updated, immediate: true)
+    }
+
+    private func replacing(_ range: NSRange, with replacement: String) -> String {
+        let text = lastText as NSString
+        guard range.location >= 0, range.location <= text.length else { return lastText }
+        let safe = NSRange(location: range.location, length: min(range.length, text.length - range.location))
+        return text.replacingCharacters(in: safe, with: replacement)
     }
 
     // MARK: - 撤销
@@ -355,10 +423,6 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: - 外观
-
-    private func applyAppearance() {
-        NSApplication.shared.appearance = appearanceMode.appearance
-    }
 
     // MARK: - 树
 
@@ -559,7 +623,7 @@ final class AppModel: ObservableObject {
 
     func applyValueEdit(node: JSONNode, rawValue: String) {
         let edit = JSONTextPatch.replacingValue(of: node, withRawValue: rawValue)
-        editor?.replaceCharacters(in: edit.range, with: edit.replacement)
+        replaceCharacters(edit.range, with: edit.replacement)
         refreshNow()
         showToast("已修改值")
     }
@@ -581,7 +645,7 @@ final class AppModel: ObservableObject {
         guard keyRange.location >= 0, keyRange.location + keyRange.length <= ns.length else {
             return "文本已变化，请稍后重试"
         }
-        editor?.replaceCharacters(in: keyRange, with: jsonStringLiteral(from: trimmed))
+        replaceCharacters(keyRange, with: jsonStringLiteral(from: trimmed))
         refreshNow()
         showToast("已修改键名")
         return nil
@@ -599,7 +663,7 @@ final class AppModel: ObservableObject {
             let text = editor?.text ?? lastText
             let edit = try JSONTextPatch.addingMember(in: text, object: object, key: key, rawValue: rawValue)
             expandedKeys.insert(expansionKey(forNode: object))
-            editor?.replaceCharacters(in: edit.range, with: edit.replacement)
+            replaceCharacters(edit.range, with: edit.replacement)
             refreshNow()
             showToast("已添加成员")
             return nil
@@ -613,7 +677,7 @@ final class AppModel: ObservableObject {
             let text = editor?.text ?? lastText
             let edit = try JSONTextPatch.addingElement(in: text, array: array, rawValue: rawValue)
             expandedKeys.insert(expansionKey(forNode: array))
-            editor?.replaceCharacters(in: edit.range, with: edit.replacement)
+            replaceCharacters(edit.range, with: edit.replacement)
             refreshNow()
             showToast("已添加元素")
             return nil
@@ -626,7 +690,7 @@ final class AppModel: ObservableObject {
         do {
             let text = editor?.text ?? lastText
             let edit = try JSONTextPatch.deleting(in: text, node: node)
-            editor?.replaceCharacters(in: edit.range, with: edit.replacement)
+            replaceCharacters(edit.range, with: edit.replacement)
             if treeUI.selectedRowID == node.range.location { treeUI.selectedRowID = nil }
             refreshNow()
             showToast("已删除节点")
@@ -719,8 +783,8 @@ final class AppModel: ObservableObject {
     // MARK: - 格式化
 
     var canTransformText: Bool {
-        guard !isParsing, let editor else { return false }
-        return lastText == editor.text
+        guard !isParsing else { return false }
+        return true
     }
 
     func format(indent: Int) {
@@ -730,7 +794,7 @@ final class AppModel: ObservableObject {
         }
         indentWidth = indent
         let pretty = JSONFormatter.prettyPrinted(root, indentWidth: indent)
-        editor?.replaceAllText(pretty, undoable: true)
+        replaceCharacters(NSRange(location: 0, length: (lastText as NSString).length), with: pretty)
         refreshNow()
         showToast("已格式化（\(indent) 空格缩进）")
     }
@@ -740,65 +804,14 @@ final class AppModel: ObservableObject {
             showToast("JSON 正在解析或不合法，请稍后重试")
             return
         }
-        editor?.replaceAllText(JSONFormatter.minified(root), undoable: true)
+        replaceCharacters(NSRange(location: 0, length: (lastText as NSString).length), with: JSONFormatter.minified(root))
         refreshNow()
         showToast("已压缩")
     }
 
     // MARK: - 文件与演示
 
-    func openFilePanel() {
-        let panel = NSOpenPanel()
-        panel.title = "打开 JSON 文件"
-        panel.allowedContentTypes = [.json, .plainText, .text]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        if panel.runModal() == .OK, let url = panel.url {
-            open(url: url)
-        }
-    }
-
-    func open(url: URL) {
-        guard editor != nil else {
-            pendingOpenURL = url
-            return
-        }
-        do {
-            let data = try Data(contentsOf: url)
-            guard let text = Self.decodeText(data) else {
-                showToast("无法识别文件编码")
-                return
-            }
-            load(text: text, fileName: url.lastPathComponent)
-        } catch {
-            showToast("打开失败：\(error.localizedDescription)")
-        }
-    }
-
-    func loadDemo() {
-        load(text: DemoJSON.text, fileName: "示例.json")
-    }
-
-    private func load(text: String, fileName: String?) {
-        self.fileName = fileName
-        self.toast = nil
-        shouldRevealErrorAfterParse = true
-        editor?.replaceAllText(text, undoable: false)
-        undoManager.removeAllActions()
-        refreshUndoState()
-        expandedKeys = []
-        autoExpandRootOnNextParse = true
-        treeUI.selectedRowID = nil
-        tree.pendingScrollTarget = nil
-        searchResult = .empty
-        currentHitIndex = nil
-        editor?.setSearchHighlights(ranges: [], current: nil)
-        scheduleParse(text, immediate: true)
-        showToast(fileName == nil ? "已载入内容" : "已打开 \(fileName!)")
-        editor?.focus()
-    }
-
-    private static func decodeText(_ data: Data) -> String? {
+    static func decodeText(_ data: Data) -> String? {
         if data.starts(with: [0xEF, 0xBB, 0xBF]) {
             return String(decoding: data.dropFirst(3), as: UTF8.self)
         }
@@ -814,7 +827,7 @@ final class AppModel: ObservableObject {
     // MARK: - 复制
 
     func copyAll() {
-        let text = editor?.text ?? ""
+        let text = lastText
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
@@ -846,16 +859,16 @@ final class AppModel: ObservableObject {
     func jumpToError() {
         guard case .error(let error) = parseState else { return }
         let location = min(max(0, error.utf16Offset), characterCount)
-        editor?.reveal(NSRange(location: location, length: 0), select: false)
+        let range = NSRange(location: location, length: 0)
+        if let editor {
+            editor.reveal(range, select: false)
+        } else {
+            pendingRevealRange = range
+            workspace?.showEditor(for: self)
+        }
     }
 
     func showToast(_ message: String) {
-        toast = message
-        toastWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            if self?.toast == message { self?.toast = nil }
-        }
-        toastWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
+        workspace?.showToast(message)
     }
 }

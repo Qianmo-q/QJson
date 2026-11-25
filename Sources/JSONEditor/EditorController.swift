@@ -46,7 +46,7 @@ final class EditorController: NSObject, NSTextViewDelegate {
         )
         textView.editor = self
         textView.isRichText = false
-        textView.allowsUndo = true
+        textView.allowsUndo = false
         textView.isEditable = true
         textView.isSelectable = true
         textView.drawsBackground = true
@@ -134,20 +134,18 @@ final class EditorController: NSObject, NSTextViewDelegate {
         textView.scrollRangeToVisible(range)
     }
 
-    func replaceAllText(_ text: String, undoable: Bool) {
+    func replaceTextSynchronized(_ text: String) {
         let length = textView.textStorage?.length ?? 0
-        let full = NSRange(location: 0, length: length)
-        if undoable, textView.undoManager != nil {
-            textView.undoManager?.beginUndoGrouping()
-            textView.insertText(text, replacementRange: full)
-            textView.undoManager?.endUndoGrouping()
-        } else {
-            textView.undoManager?.removeAllActions()
-            textView.textStorage?.replaceCharacters(in: full, with: text)
-            applyBaseAttributes()
-            textView.setSelectedRange(NSRange(location: 0, length: 0))
-            handleTextChanged()
-        }
+        guard textView.string != text else { return }
+        let selection = textView.selectedRange()
+        let scrollOrigin = scrollView.contentView.bounds.origin
+        textView.textStorage?.replaceCharacters(in: NSRange(location: 0, length: length), with: text)
+        applyBaseAttributes()
+        let updatedLength = textView.textStorage?.length ?? 0
+        textView.setSelectedRange(NSRange(location: min(selection.location, updatedLength), length: 0))
+        scrollView.contentView.scroll(to: scrollOrigin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        handleTextChanged(notifyModel: false)
     }
 
     func replaceCharacters(in range: NSRange, with replacement: String) {
@@ -224,7 +222,7 @@ final class EditorController: NSObject, NSTextViewDelegate {
 
     // MARK: - 文本变化
 
-    func handleTextChanged() {
+    func handleTextChanged(notifyModel: Bool = true) {
         let text = textView.string
         lineStarts = Self.fastLineStarts(text)
         errorLineNumber = nil
@@ -236,11 +234,17 @@ final class EditorController: NSObject, NSTextViewDelegate {
         lastHighlightRange = clamp(lastHighlightRange, length)
         refreshHighlight()
         updateCaret()
-        model?.editorTextDidChange(text, lineStarts: lineStarts)
+        if notifyModel {
+            model?.editorTextDidChange(text, lineStarts: lineStarts)
+        }
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
         updateCaret()
+    }
+
+    func textDidBeginEditing(_ notification: Notification) {
+        model?.editorDidFocus()
     }
 
     func undoManager(for view: NSTextView) -> UndoManager? {

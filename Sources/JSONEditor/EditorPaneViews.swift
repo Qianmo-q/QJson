@@ -16,6 +16,13 @@ struct EditorRepresentable: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {}
 
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        if let controller = coordinator.controller {
+            coordinator.controller?.model?.detach(editor: controller)
+        }
+        coordinator.controller = nil
+    }
+
     final class Coordinator {
         var controller: EditorController?
     }
@@ -162,18 +169,23 @@ struct SearchResultsView: View {
 }
 
 struct StatusBarView: View {
-    @ObservedObject var model: AppModel
+    @ObservedObject var workspace: WorkspaceModel
 
     var body: some View {
         HStack(spacing: 12) {
-            parseStatus
-            Spacer(minLength: 8)
-            Text("行 \(model.lineCount)")
-            Text("Ln \(model.caretLine), Col \(model.caretColumn)")
-            if model.selectionLength > 0 {
-                Text("选中 \(model.selectionLength)")
+            if let model = workspace.activeModel {
+                parseStatus(model: model)
+                Spacer(minLength: 8)
+                Text("行 \(model.lineCount)")
+                Text("Ln \(model.caretLine), Col \(model.caretColumn)")
+                if model.selectionLength > 0 {
+                    Text("选中 \(model.selectionLength)")
+                }
+                Text("字符 \(model.characterCount)")
+            } else {
+                Text("就绪")
+                Spacer()
             }
-            Text("字符 \(model.characterCount)")
             Rectangle().fill(Theme.border).frame(width: 1, height: 12)
             appearancePicker
         }
@@ -188,8 +200,10 @@ struct StatusBarView: View {
     }
 
     @ViewBuilder
-    private var parseStatus: some View {
-        if model.isParsing {
+    private func parseStatus(model: AppModel) -> some View {
+        if model.isEmpty {
+            Text("空标签页")
+        } else if model.isParsing {
             HStack(spacing: 5) {
                 ProgressView().controlSize(.small).scaleEffect(0.7)
                 Text("解析中…")
@@ -223,7 +237,7 @@ struct StatusBarView: View {
     }
 
     private var appearancePicker: some View {
-        Picker("主题", selection: $model.appearanceMode) {
+        Picker("主题", selection: $workspace.appearanceMode) {
             ForEach(AppearanceMode.allCases) { mode in
                 Text(mode.label).tag(mode)
             }
